@@ -1,0 +1,174 @@
+---
+description: best practices for writing AWS Cloud Development Kit (CDK) code
+globs: bin/*.ts,lib/**/*.ts
+alwaysApply: false
+---
+# Writing AWS CDK Stacks and Construct Code
+
+This document provides comprehensive guidelines and best practices for writing AWS Cloud Development Kit (CDK) code. It covers project configuration, stack organization, naming conventions, dependency management, and patterns for effective resource sharing between stacks. Follow these guidelines to create maintainable, scalable, and well-structured CDK applications.
+
+Please refer to the following guidelines when writing AWS CDK code.
+
+## Project Config
+
+The project has a single configuration file. The default location for the configuration file is `project root/.toml`.
+
+In CDK projects, TypeScript files under `project root/bin` are executable files. The project configuration file should only be imported in these executable files and should not be imported in any other files.
+
+Below is an example of code that loads the configuration file. It loads the configuration file from the default location and checks for differences with a predefined schema.
+
+The predefined schema takes precedence, and if the given configuration file does not match the schema, an error should be thrown. The `joi` library is used for schema checking.
+
+Here is an example code for schema loading:
+
+### Schema Validation
+
+```typescript
+interface IConfig {
+  app: {
+    ns: string;
+    stage: string;
+  };
+  aws: {
+    region: string;
+  };
+};
+
+const cfg = toml.parse(
+  fs.readFileSync(path.resolve(__dirname, '..', '.toml'), 'utf-8'),
+);
+console.log('loaded config', cfg);
+
+const schema = joi
+  .object({
+    app: joi
+      .object({
+        ns: joi.string().required(),
+        stage: joi.string().required(),
+      })
+      .required(),
+    aws: joi
+      .object({
+        region: joi.string().required(),
+      })
+      .required(),
+  }).unknown()
+
+const { error } = schema.validate(cfg);
+
+if (error) {
+  throw new Error(`Config validation error: ${error.message}`);
+}
+
+export const Config: IConfig = {
+  ...cfg,
+  app: {
+    ...cfg.app,
+    ns: `${cfg.app.ns}${cfg.app.stage}`,
+  },
+};
+```
+
+## Stacks and Constructs
+
+An AWS CDK project can have multiple stacks. A stack is the minimum unit that can be deployed and managed individually, so it should be written in a reusable and logically distinct appropriate unit.
+
+Stack classes are written under `project root/lib/stacks`, and Construct classes are written under `project root/lib/constructs`.
+
+For example, an AWS ECS project is recommended to have the following stacks:
+
+```
+- AuthStack: A stack for Cognito user authentication. Cognito should exist independently of external services.
+- GatewayStack: A stack for API Gateway. API Gateway should continue to exist even if no services exist.
+- CommonECSStack: A stack for AWS ECS Cluster. The cluster should be reusable even if subordinate services disappear.
+- Mock1ServiceStack: A stack for AWS ECS Service, which should have subordinate Constructs included in the logical unit of the service. It should be able to be modified and deleted independently of Mock2ServiceStack.
+- Mock2ServiceStack: A stack for AWS ECS Service, which should have subordinate Constructs included in the logical unit of the service. It should be able to be modified and deleted independently of Mock1ServiceStack.
+```
+
+## Stack and Construct Naming scope
+
+- In CDK, the name of a Stack should use the `ns` value from the project configuration file as a prefix and have a unique value within the project.
+- In CDK, the name of a Construct should have a unique value within the Stack.
+
+## Stack Dependencies
+
+### Explicit dependency
+There may be cases where there is an order in which stacks need to be created and deployed. If there are dependencies between stacks, they should be explicitly indicated.
+Below is an example code that explicitly indicates dependencies between stacks:
+
+```typescript
+const authStack = new AuthStack(app, `${Config.app.ns}AuthStack`, {
+  redirectUris: Config.auth.redirectUris,
+});
+
+const gatewayStack = new GatewayStack(app, `${Config.app.ns}GatewayStack`, {
+  userPool: authStack.userPool,
+  userPoolClient: authStack.userPoolClient,
+});
+// gatewayStack has a dependency on authStack
+gatewayStack.addDependency(authStack);
+```
+
+### Implicit dependency and maintain acyclic dependencies
+
+In the example below, there may be cases where cyclic dependencies occur when modifying the properties of AuthStack in GatewayStack.
+
+There are mainly two ways to avoid cyclic dependencies:
+1. Instead of using the resource value passed through the constructor as is, explicitly import the resource within the stack using its id values such as arn to change the scope of the resource to within the stack.
+2. Instead of adding sub-resources in the form of `addXXX` to the resource passed through the constructor, explicitly add them by creating a new Construct.
+
+The following is an example of redefining the scope of a resource within a stack using fromAttribute for apigateway:
+```typescript
+export class ServiceStack extends cdk.Stack {
+  constructor(scope: cdk.Construct, id: string, props: ServiceProps) {
+    super(scope, id, props);
+
+    const restApi = apigw.RestApi.fromRestApiAttributes(this, `RestApi`, {
+      restApiId: props.restApiId,
+      rootResourceId: props.restApiRootId,
+    });
+    const loadBalancer = elbv2.ApplicationLoadBalancer.fromApplicationLoadBalancerAttributes(this, `ALB`, {
+      loadBalancerArn: props.loadBalancerArn,
+      securityGroupId: props.loadBalancerSecurityGroupId,
+      vpc: props.cluster.vpc,
+    });
+  }
+}
+```
+
+### Guidelines for passing values between stacks
+
+There are several ways to pass values between stacks, but unless there is a reason to use a different method, you must use the method of passing through the property of the constructor.
+
+Below is an example code of passing values between stacks through properties:
+
+```typescript
+// First stack (resource creation)
+export class ResourceStack extends cdk.Stack {
+  public readonly myResource: SomeResourceType;
+
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    this.myResource = new SomeResourceType(this, 'MyResource', {
+      // Resource properties
+    });
+  }
+}
+
+// Second stack (resource usage)
+interface ConsumerStackProps extends cdk.StackProps {
+  myResource: SomeResourceType;
+}
+
+export class ConsumerStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: ConsumerStackProps) {
+    super(scope, id, props);
+
+    // Using the resource passed through props
+    new SomeConstruct(this, 'MyConstruct', {
+      resource: props.myResource
+    });
+  }
+}
+``` 
